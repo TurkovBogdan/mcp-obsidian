@@ -263,7 +263,7 @@ class Obsidian:
         target_type: str,
         target: str,
         content: str,
-        create_heading_if_missing: bool = True,
+        create_heading_if_missing: bool = False,
         template_path: str | None = None,
         use_template: bool = True,
     ) -> Any:
@@ -648,6 +648,19 @@ class Obsidian:
         # No boundary found - section extends to end of file
         return len(lines)
 
+    def _split_heading_path(self, target: str) -> list[str]:
+        """Split a heading path into parts using '::' as separator.
+
+        Args:
+            target: Raw heading target string, e.g. "Heading" or "Parent::Child"
+
+        Returns:
+            List of stripped heading path parts (length 1 for a simple heading)
+        """
+        if "::" in target:
+            return [p.strip() for p in target.split("::")]
+        return [target]
+
     def _find_heading_in_structure(
         self,
         headings: list[tuple[int, str, int]],
@@ -659,12 +672,13 @@ class Obsidian:
 
         Args:
             headings: Parsed heading structure (level, text, line_num)
-            target: Heading text to find, or "Parent::Child" for nested
+            target: Exact heading text as it appears in the file, or
+                    "Parent::Child" for nested lookup
 
         Returns:
             Tuple of (level, text, line_num) or None if not found
         """
-        parts = target.split("::")
+        parts = self._split_heading_path(target)
 
         if len(parts) == 1:
             # Simple heading - find first match
@@ -839,7 +853,7 @@ class Obsidian:
         """
         # Determine heading level from the target (e.g., "Todos" -> "## Todos")
         # Default to h2 for top-level headings
-        heading_parts = heading.split("::")
+        heading_parts = self._split_heading_path(heading)
         heading_level = len(heading_parts) + 1  # h2 for top-level, h3 for nested, etc.
         final_heading = heading_parts[-1]  # Use the last part as the heading text
 

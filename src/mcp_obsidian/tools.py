@@ -281,7 +281,7 @@ class PatchContentToolHandler(ToolHandler):
     def get_tool_description(self):
         return Tool(
             name=self.name,
-            description="Insert content into an existing note relative to a heading, block reference, or frontmatter field. For headings, automatically creates the heading if it doesn't exist, positioning it based on a template structure if available.",
+            description="Insert content into an existing note relative to a heading, block reference, or frontmatter field. For headings, the target must be the exact heading text as it appears in the file. Returns an error if the heading is not found.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -302,13 +302,18 @@ class PatchContentToolHandler(ToolHandler):
                     },
                     "target": {
                         "type": "string",
-                        "description": "Target identifier (heading path, block reference, or frontmatter field)",
+                        "description": (
+                            "Target identifier. "
+                            "heading: exact text without '#', e.g. 'Step 2: Create a presentation'; "
+                            "nested headings: 'Parent::Child'. '>' and '/' are not separators. "
+                            "block: block reference id. frontmatter: field name."
+                        ),
                     },
                     "content": {"type": "string", "description": "Content to insert"},
                     "create_heading_if_missing": {
                         "type": "boolean",
-                        "description": "If true (default), automatically create the heading when target_type is 'heading' and the heading doesn't exist. Set to false to get an error instead.",
-                        "default": True,
+                        "description": "If true, create the heading when it doesn't exist. Default false — returns an error if not found.",
+                        "default": False,
                     },
                     "template_path": {
                         "type": "string",
@@ -352,7 +357,7 @@ class PatchContentToolHandler(ToolHandler):
             args.get("target_type", ""),
             args.get("target", ""),
             args.get("content", ""),
-            args.get("create_heading_if_missing", True),
+            args.get("create_heading_if_missing", False),
             args.get("template_path"),
             args.get("use_template", True),
         )
