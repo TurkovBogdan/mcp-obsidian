@@ -5,6 +5,14 @@ from urllib.parse import quote, unquote
 import unicodedata
 import os
 from typing import Any
+import yaml
+
+
+class _IndentedDumper(yaml.Dumper):
+    """YAML Dumper that indents list items (Obsidian convention)."""
+
+    def increase_indent(self, flow=False, indentless=False):
+        return super().increase_indent(flow=flow, indentless=False)
 
 
 class HeadingNotFoundError(Exception):
@@ -117,6 +125,25 @@ class Obsidian:
 
         return encoded_path
 
+    def _normalize_filepath(self, filepath: str) -> str:
+        """Add .md extension to a file path that has no extension.
+
+        Skips directory paths (ending with '/') and paths that already
+        have any extension (e.g. .png, .pdf, .md).
+
+        Args:
+            filepath: Vault-relative file path
+
+        Returns:
+            filepath with .md appended when the path had no extension
+        """
+        if filepath.endswith("/"):
+            return filepath
+        _, ext = os.path.splitext(filepath)
+        if not ext:
+            return filepath + ".md"
+        return filepath
+
     def list_files_in_vault(self) -> Any:
         url = f"{self.get_base_url()}/vault/"
 
@@ -154,6 +181,7 @@ class Obsidian:
         return self._safe_call(call_fn)
 
     def get_file_contents(self, filepath: str) -> Any:
+        filepath = self._normalize_filepath(filepath)
         encoded_path = self._encode_path(filepath)
         url = f"{self.get_base_url()}/vault/{encoded_path}"
 
@@ -181,7 +209,7 @@ class Obsidian:
         """
         result = []
 
-        for filepath in filepaths:
+        for filepath in (self._normalize_filepath(fp) for fp in filepaths):
             try:
                 content = self.get_file_contents(filepath)
                 result.append(f"# {filepath}\n\n{content}\n\n---\n\n")
@@ -211,6 +239,7 @@ class Obsidian:
         return self._safe_call(call_fn)
 
     def append_content(self, filepath: str, content: str) -> Any:
+        filepath = self._normalize_filepath(filepath)
         encoded_path = self._encode_path(filepath)
         url = f"{self.get_base_url()}/vault/{encoded_path}"
 
@@ -238,6 +267,7 @@ class Obsidian:
         template_path: str | None = None,
         use_template: bool = True,
     ) -> Any:
+        filepath = self._normalize_filepath(filepath)
         # For heading operations, use the smarter read-modify-write approach
         # This bypasses the buggy REST API PATCH endpoint
         if target_type == "heading":
@@ -256,7 +286,12 @@ class Obsidian:
                 else:
                     raise Exception(f"Error 40080: Heading '{target}' not found")
 
-        # For block and frontmatter operations, use the REST API PATCH endpoint
+        # For frontmatter, use our own read-modify-write so that files without
+        # a frontmatter block (or without the target field) are handled correctly.
+        if target_type == "frontmatter":
+            return self._patch_frontmatter_content(filepath, operation, target, content)
+
+        # For block operations, use the REST API PATCH endpoint
         encoded_path = self._encode_path(filepath)
         url = f"{self.get_base_url()}/vault/{encoded_path}"
 
@@ -327,6 +362,121 @@ class Obsidian:
 
         return result
 
+    def _extract_frontmatter_and_body(self, content: str) -> tuple[dict, str]:
+        """Split markdown into a frontmatter dict and the body text.
+
+        Returns:
+            (frontmatter_dict, body) where body is everything after the closing ---.
+            If no valid frontmatter is found, returns ({}, original_content).
+        """
+        if not content.startswith("---"):
+            return {}, content
+
+        # Find closing --- (may have trailing whitespace, handles end-of-file too)
+        fm_end = re.search(r"\n---[ \t]*(?:\n|$)", content[3:])
+        if not fm_end:
+            return {}, content
+
+        fm_text = content[4 : 3 + fm_end.start()]
+        body_start = 3 + fm_end.end()
+        body = content[body_start:]
+
+        try:
+            fm_dict = yaml.safe_load(fm_text) or {}
+            if not isinstance(fm_dict, dict):
+                fm_dict = {}
+        except yaml.YAMLError:
+            fm_dict = {}
+
+        return fm_dict, body
+
+    def _parse_yaml_value(self, content: str) -> Any:
+        """Parse a content string as a YAML value (list or scalar).
+
+        Normalises leading whitespace on each line so that indented list
+        syntax (``  - item``) is accepted just like bare ``- item``.
+        Dicts are intentionally rejected and returned as plain strings to
+        avoid mis-parsing field values like ``"Title: subtitle"``.
+        """
+        lines = content.split("\n")
+        normalized = "\n".join(line.lstrip() for line in lines if line.strip())
+
+        if not normalized:
+            return content.strip()
+
+        try:
+            value = yaml.safe_load(normalized)
+            # Accept lists and scalars; reject dicts (likely unintended)
+            if value is not None and not isinstance(value, dict):
+                return value
+        except yaml.YAMLError:
+            pass
+
+        return content.strip()
+
+    def _patch_frontmatter_content(
+        self,
+        filepath: str,
+        operation: str,
+        target: str,
+        content: str,
+    ) -> Any:
+        """Patch a frontmatter field using read-modify-write.
+
+        Unlike the Obsidian REST API PATCH endpoint this implementation:
+        - Creates the frontmatter block when the file has none.
+        - Creates the target field when it is absent.
+        - Supports append / prepend for list-valued fields.
+
+        Args:
+            filepath:  Vault-relative path to the note.
+            operation: ``"replace"``, ``"append"``, or ``"prepend"``.
+            target:    Frontmatter field name (e.g. ``"tags"``).
+            content:   Value to set / add, expressed as a YAML snippet
+                       (e.g. ``"- tag1\\n- tag2"`` for a list).
+
+        Returns:
+            None on success.
+        """
+        current_content = self.get_file_contents(filepath)
+        fm_dict, body = self._extract_frontmatter_and_body(current_content)
+        new_value = self._parse_yaml_value(content)
+
+        if target not in fm_dict:
+            # Field absent – create it regardless of the requested operation
+            fm_dict[target] = new_value
+        else:
+            existing = fm_dict[target]
+            if operation == "replace":
+                fm_dict[target] = new_value
+            elif operation == "append":
+                if isinstance(existing, list):
+                    items = new_value if isinstance(new_value, list) else [new_value]
+                    fm_dict[target] = existing + items
+                else:
+                    fm_dict[target] = str(existing) + str(new_value)
+            elif operation == "prepend":
+                if isinstance(existing, list):
+                    items = new_value if isinstance(new_value, list) else [new_value]
+                    fm_dict[target] = items + existing
+                else:
+                    fm_dict[target] = str(new_value) + str(existing)
+
+        fm_yaml = yaml.dump(
+            fm_dict,
+            Dumper=_IndentedDumper,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=False,
+        )
+
+        # Ensure a blank line separates frontmatter from body
+        if body and not body.startswith("\n"):
+            body = "\n" + body
+
+        new_content = f"---\n{fm_yaml}---\n{body}"
+        return self.put_content(filepath, new_content)
+
     def _get_template_for_file(self, filepath: str, content: str) -> str | None:
         """Get template path from frontmatter or folder convention.
 
@@ -362,6 +512,10 @@ class Obsidian:
     def _parse_heading_structure(self, content: str) -> list[tuple[int, str, int]]:
         """Parse markdown to extract heading hierarchy with line positions.
 
+        Skips lines inside fenced code blocks (``` or ~~~) so that comment
+        lines such as ``# note`` inside a Python block are not treated as
+        headings.
+
         Args:
             content: Markdown content
 
@@ -370,8 +524,30 @@ class Obsidian:
         """
         headings: list[tuple[int, str, int]] = []
         lines = content.split("\n")
+        in_code_block = False
+        code_fence_char: str | None = None
+        code_fence_len = 0
 
         for i, line in enumerate(lines):
+            # Detect fenced code block boundaries (``` or ~~~, 3+ chars)
+            fence_match = re.match(r"^(`{3,}|~{3,})", line)
+            if fence_match:
+                fence = fence_match.group(1)
+                if not in_code_block:
+                    in_code_block = True
+                    code_fence_char = fence[0]
+                    code_fence_len = len(fence)
+                elif fence[0] == code_fence_char and len(fence) >= code_fence_len:
+                    # Closing fence must use same character and be at least as long
+                    in_code_block = False
+                    code_fence_char = None
+                    code_fence_len = 0
+                # Fence delimiter lines are never headings — skip heading check
+                continue
+
+            if in_code_block:
+                continue
+
             match = re.match(r"^(#{1,6})\s+(.+)$", line)
             if match:
                 level = len(match.group(1))
@@ -710,6 +886,7 @@ class Obsidian:
         return self.put_content(filepath, new_content)
 
     def put_content(self, filepath: str, content: str) -> Any:
+        filepath = self._normalize_filepath(filepath)
         encoded_path = self._encode_path(filepath)
         url = f"{self.get_base_url()}/vault/{encoded_path}"
 
@@ -735,6 +912,7 @@ class Obsidian:
         Returns:
             None on success
         """
+        filepath = self._normalize_filepath(filepath)
         encoded_path = self._encode_path(filepath)
         url = f"{self.get_base_url()}/vault/{encoded_path}"
 
@@ -980,6 +1158,7 @@ class Obsidian:
         Returns:
             None on success
         """
+        filename = self._normalize_filepath(filename)
         encoded_filename = self._encode_path(filename)
         url = f"{self.get_base_url()}/open/{encoded_filename}"
         params = {"newLeaf": str(new_leaf).lower()}
